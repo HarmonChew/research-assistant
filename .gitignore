@@ -1,0 +1,48 @@
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python Cache / Build ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+wheels/
+share/python-wheels/
+
+# --- Installer Logs ---
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Unit Test / Coverage ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# --- IDE / Editor Stuff ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- OS-specific Noise ---
+.DS_Store
+Thumbs.db
