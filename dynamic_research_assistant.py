@@ -3,6 +3,7 @@
 
 import os, re, time, math, logging
 from typing import List, Dict, Any, Literal, Optional, TypedDict
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -20,6 +21,14 @@ try:
     from sklearn.metrics import silhouette_score
     import ollama
 except ImportError as e:
+    logger.error(f"Missing required dependency: {e}")
+    exit(1)
+
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError as e:
+    OPENAI_AVAILABLE = False
     logger.error(f"Missing required dependency: {e}")
     exit(1)
 
@@ -195,6 +204,8 @@ Guidelines:
 - Reference the data provided below
 - Focus on insights and patterns
 - Include actionable conclusions
+- Only output the report itself. Do not include any preface, explanation, or follow-up text.
+- Ensure that the formatting is consistent and clean.
 
 Data to analyze:
 Clusters Found: {clusters}
@@ -214,9 +225,11 @@ Quality criteria for this domain:
 - Sufficient source diversity
 - Clear analytical insights
 - Actionable conclusions
+- No obvious gaps or biases
+- No missing values
 
 Report to review:
-{report[:2000]}
+{report[:5000]}
 
 RESPOND WITH:
 OK - if the report meets quality standards
@@ -245,16 +258,92 @@ class RState(TypedDict):
     loop_count: int
     error: Optional[str]
     config: DomainConfig
+    number_of_sources: Optional[int]
+    quality_threshold: Optional[float]
+    enable_clustering: Optional[bool]
+
+def get_installed_ollama_models():
+    """Get list of installed Ollama models"""
+    try:
+        # Run ollama list command
+        result = subprocess.run(['ollama', 'list'], 
+                              capture_output=True, 
+                              text=True, 
+                              check=True)
+        
+        # Parse the output
+        lines = result.stdout.strip().split('\n')
+        models = []
+        
+        # Skip header line and parse model names
+        for line in lines[1:]:  # Skip the header
+            if line.strip():
+                # Model name is the first column
+                model_name = line.split()[0]
+                models.append(model_name)
+        
+        return models
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.warning("Could not fetch Ollama models. Is Ollama installed and running?")
+        return ["llama3", "mistral", "codellama"]  # Return defaults if ollama command fails
+    except Exception as e:
+        logger.error(f"Error getting Ollama models: {e}")
+        return ["llama3", "mistral", "codellama"]
 
 # --- Enhanced Agents with Dynamic Prompts ---
-def llm(prompt: str, model: str = "llama3") -> str:
+def llm(prompt: str, model: str = "llama3", api_key: Optional[str] = None) -> str:
+    """
+    Enhanced LLM function supporting both Ollama and OpenAI models
+    
+    Args:
+        prompt: The prompt to send to the model
+        model: Model name (e.g., "llama3" for Ollama or "gpt-4o-mini" for OpenAI)
+        api_key: OpenAI API key (optional, can also use environment variable)
+    """
+
+    logger.info(f"LLM call with model: {model}")
     try:
-        resp = ollama.chat(
-            model=model, 
-            messages=[{"role": "user", "content": prompt}], 
-            options={"temperature": 0.2}
-        )
-        return resp["message"]["content"].strip()
+        # Check if this is an OpenAI model
+        if model.startswith("gpt-"):
+            if not OPENAI_AVAILABLE:
+                return "Error: OpenAI library not installed. Run: pip install openai"
+            
+            # Get API key from parameter or environment
+            openai_api_key = api_key or os.getenv("OPENAI_API_KEY")
+            
+            if not openai_api_key:
+                return "Error: OpenAI API key not provided. Set OPENAI_API_KEY environment variable or pass api_key parameter."
+
+            print(f"Using OpenAI model: {model}, api_key: {'set' if openai_api_key else 'not set'}")
+            
+            # Initialize OpenAI client
+            client = OpenAI(api_key=openai_api_key)
+            
+            try:
+                # Make OpenAI API call
+                response = client.responses.create(
+                    model=model,
+                    input=prompt
+                )
+                return response.output_text.strip()
+                
+            except Exception as e:
+                logger.error(f"OpenAI API call failed: {e}")
+                return f"Error: OpenAI API call failed - {str(e)}"
+        
+        else:
+            # Use Ollama for non-GPT models
+            try:
+                resp = ollama.chat(
+                    model=model, 
+                    messages=[{"role": "user", "content": prompt}], 
+                    options={"temperature": 0.2}
+                )
+                return resp["message"]["content"].strip()
+            except Exception as e:
+                logger.error(f"Ollama call failed: {e}")
+                return f"Error: Ollama call failed - {str(e)}"
+                
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         return f"Error: {str(e)}"
@@ -277,14 +366,17 @@ def initialize_research_node(state: RState) -> RState:
     return state
 
 def collect_node(state: RState) -> RState:
-    """Enhanced collection with domain-specific search"""
+    """Enhanced collection with domain-specific search and settings support"""
     query = state["enhanced_query"]
+    max_sources = state.get("number_of_sources", 8)  # Use setting or default to 8
     results = []
     
     try:
         with DDGS() as ddgs:
             # Use enhanced query for better domain-specific results
-            for r in ddgs.text(query, region="us-en", safesearch="moderate", max_results=15):
+            # Request more results than needed for better filtering
+            search_limit = min(max_sources * 2, 20)  # Get double what we need, max 20
+            for r in ddgs.text(query, region="us-en", safesearch="moderate", max_results=search_limit):
                 results.append(r)
     except Exception as e:
         logger.error(f"Search failed: {e}")
@@ -299,7 +391,7 @@ def collect_node(state: RState) -> RState:
             continue
             
         try:
-            downloaded = trafilatura.fetch_url(url, timeout=10)
+            downloaded = trafilatura.fetch_url(url)
             if downloaded:
                 extracted = trafilatura.extract(downloaded) or ""
             else:
@@ -322,15 +414,17 @@ def collect_node(state: RState) -> RState:
             "cluster": None,
             "relevance_score": relevance
         })
+        print(f"Collected source: {title} ({url}) - Relevance: {relevance:.2f}, extracted length: {len(extracted)}, extracted: {extracted[:100]}...\n")
         
-        if len(sources) >= 10:
+        # Stop when we have enough good sources
+        if len(sources) >= max_sources:
             break
     
-    # Sort by relevance and keep top sources
+    # Sort by relevance and keep only the requested number
     sources.sort(key=lambda x: x["relevance_score"], reverse=True)
-    state["sources"] = sources[:8]
+    state["sources"] = sources[:max_sources]
     
-    logger.info(f"Collected {len(state['sources'])} sources")
+    logger.info(f"Collected {len(state['sources'])} sources (requested: {max_sources})")
     return state
 
 def calculate_relevance_score(content: str, domain_keywords: List[str]) -> float:
@@ -347,6 +441,8 @@ def summarize_node(state: RState) -> RState:
         return state
     
     prompt_manager = PromptTemplateManager()
+    model_name = state.get("model_name", "llama3")
+    api_key = state.get("api_key", None)  # Get API key from state
     new_sources = []
     
     for i, s in enumerate(state["sources"]):
@@ -359,7 +455,7 @@ def summarize_node(state: RState) -> RState:
             s["content"], state["domain"]
         )
         
-        summary = llm(summary_prompt)
+        summary = llm(summary_prompt, model_name, api_key)  # Pass api_key
         
         if summary.startswith("Error:"):
             logger.warning(f"Failed to summarize source {i+1}")
@@ -371,61 +467,6 @@ def summarize_node(state: RState) -> RState:
         time.sleep(0.3)
         
     state["sources"] = new_sources
-    return state
-
-def cluster_node(state: RState) -> RState:
-    """Enhanced clustering with domain-specific approaches"""
-    if state.get("error"):
-        return state
-        
-    summaries = [s["summary"] for s in state["sources"] if s["summary"]]
-    
-    if len(summaries) < 2:
-        state["clusters"] = {0: {"label": "All Sources", "members": list(range(len(state["sources"])))}}
-        for i in range(len(state["sources"])):
-            state["sources"][i]["cluster"] = 0
-        return state
-
-    try:
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        X = model.encode(summaries, normalize_embeddings=True)
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        state["clusters"] = {0: {"label": "All Sources", "members": list(range(len(state["sources"])))}}
-        return state
-
-    # Domain-specific clustering approach
-    best_k = determine_optimal_clusters(X, state["domain"])
-    
-    try:
-        km = KMeans(n_clusters=best_k, n_init="auto", random_state=42)
-        labels = km.fit_predict(X)
-    except Exception as e:
-        logger.error(f"Clustering failed: {e}")
-        labels = [0] * len(summaries)
-        best_k = 1
-
-    # Build clusters
-    clusters: Dict[int, Dict[str, Any]] = {i: {"label": "", "members": []} for i in range(best_k)}
-    for idx, lab in enumerate(labels):
-        state["sources"][idx]["cluster"] = int(lab)
-        clusters[int(lab)]["members"].append(idx)
-
-    # Generate domain-specific cluster names
-    prompt_manager = PromptTemplateManager()
-    for cid, info in clusters.items():
-        if not info["members"]:
-            continue
-            
-        sample_summaries = [state["sources"][idx]["summary"] for idx in info["members"][:3]]
-        cluster_prompt = prompt_manager.generate_cluster_prompt(
-            sample_summaries, state["domain"]
-        )
-        
-        label = llm(cluster_prompt)
-        clusters[cid]["label"] = label if not label.startswith("Error:") else f"Group {cid+1}"
-
-    state["clusters"] = clusters
     return state
 
 def determine_optimal_clusters(X, domain: ResearchDomain) -> int:
@@ -457,6 +498,106 @@ def determine_optimal_clusters(X, domain: ResearchDomain) -> int:
     
     return max(2, min(preferred_k, n_samples - 1))
 
+# Updated functions for dynamic_research_assistant.py
+# These replace the existing functions to use the model parameter from state
+
+def summarize_node(state: RState) -> RState:
+    """Enhanced summarization with domain-specific prompts"""
+    if state.get("error"):
+        return state
+    
+    prompt_manager = PromptTemplateManager()
+    model_name = state.get("model_name", "llama3")  # Get model from state
+    new_sources = []
+    
+    for i, s in enumerate(state["sources"]):
+        if s["summary"]:
+            new_sources.append(s)
+            continue
+            
+        # Generate domain-specific summary prompt
+        summary_prompt = prompt_manager.generate_summary_prompt(
+            s["content"], state["domain"]
+        )
+        
+        summary = llm(summary_prompt, model_name)  # Pass model parameter
+        
+        if summary.startswith("Error:"):
+            logger.warning(f"Failed to summarize source {i+1}")
+            s["summary"] = f"• {s['title']}\n• Source: {s['url']}\n• Content available for analysis"
+        else:
+            s["summary"] = summary
+            
+        new_sources.append(s)
+        time.sleep(0.3)
+        
+    state["sources"] = new_sources
+    return state
+
+def cluster_node(state: RState) -> RState:
+    """Enhanced clustering with domain-specific approaches and clustering toggle"""
+    if state.get("error"):
+        return state
+    
+    enable_clustering = state.get("enable_clustering", True)
+    model_name = state.get("model_name", "llama3")
+    api_key = state.get("api_key", None)  # Get API key from state
+    
+    if not enable_clustering:
+        state["clusters"] = {0: {"label": "All Sources", "members": list(range(len(state["sources"])))}}
+        for i in range(len(state["sources"])):
+            state["sources"][i]["cluster"] = 0
+        logger.info("Clustering disabled - all sources in single group")
+        return state
+        
+    summaries = [s["summary"] for s in state["sources"] if s["summary"]]
+    
+    if len(summaries) < 2:
+        state["clusters"] = {0: {"label": "All Sources", "members": list(range(len(state["sources"])))}}
+        for i in range(len(state["sources"])):
+            state["sources"][i]["cluster"] = 0
+        return state
+
+    try:
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        X = model.encode(summaries, normalize_embeddings=True)
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        state["clusters"] = {0: {"label": "All Sources", "members": list(range(len(state["sources"])))}}
+        return state
+
+    best_k = determine_optimal_clusters(X, state["domain"])
+    
+    try:
+        km = KMeans(n_clusters=best_k, n_init="auto", random_state=42)
+        labels = km.fit_predict(X)
+    except Exception as e:
+        logger.error(f"Clustering failed: {e}")
+        labels = [0] * len(summaries)
+        best_k = 1
+
+    clusters: Dict[int, Dict[str, Any]] = {i: {"label": "", "members": []} for i in range(best_k)}
+    for idx, lab in enumerate(labels):
+        state["sources"][idx]["cluster"] = int(lab)
+        clusters[int(lab)]["members"].append(idx)
+
+    prompt_manager = PromptTemplateManager()
+    for cid, info in clusters.items():
+        if not info["members"]:
+            continue
+            
+        sample_summaries = [state["sources"][idx]["summary"] for idx in info["members"][:3]]
+        cluster_prompt = prompt_manager.generate_cluster_prompt(
+            sample_summaries, state["domain"]
+        )
+        
+        label = llm(cluster_prompt, model_name, api_key)  # Pass api_key
+        clusters[cid]["label"] = label if not label.startswith("Error:") else f"Group {cid+1}"
+
+    state["clusters"] = clusters
+    return state
+
+
 def table_node(state: RState) -> RState:
     """Enhanced table generation with domain-specific columns"""
     if state.get("error"):
@@ -464,8 +605,9 @@ def table_node(state: RState) -> RState:
         
     prompt_manager = PromptTemplateManager()
     config = state["config"]
+    model_name = state.get("model_name", "llama3")
+    api_key = state.get("api_key", None)  # Get API key from state
     
-    # Generate domain-specific table header
     header = "| " + " | ".join(config.analysis_dimensions) + " |\n"
     header += "|" + "---|" * len(config.analysis_dimensions) + "\n"
     
@@ -475,11 +617,10 @@ def table_node(state: RState) -> RState:
             s["summary"], state["domain"]
         )
         
-        cell = llm(table_prompt)
+        cell = llm(table_prompt, model_name, api_key)  # Pass api_key
         if not cell.startswith("|"):
-            # Fallback row
             fallback_values = ["Unknown"] * len(config.analysis_dimensions)
-            fallback_values[0] = s["title"][:30]  # First column gets title
+            fallback_values[0] = s["title"][:30]
             cell = "| " + " | ".join(fallback_values) + " |"
         
         rows.append(cell)
@@ -494,21 +635,20 @@ def report_node(state: RState) -> RState:
         return state
     
     prompt_manager = PromptTemplateManager()
+    model_name = state.get("model_name", "llama3")
+    api_key = state.get("api_key", None)  # Get API key from state
     
-    # Generate cluster overview
     cluster_overview = "\n".join([
         f"- **{info['label']}**: {len(info['members'])} sources" 
         for cid, info in state["clusters"].items() if info['members']
     ])
     
-    # Generate domain-specific report
     report_prompt = prompt_manager.generate_report_prompt(
         cluster_overview, state["table_md"], state["domain"], state["original_query"]
     )
     
-    report_md = llm(report_prompt)
+    report_md = llm(report_prompt, model_name, api_key)  # Pass api_key
     
-    # Add methodology and sources appendix
     methodology = f"""
 ---
 
@@ -517,6 +657,7 @@ def report_node(state: RState) -> RState:
 - **Sources Analyzed**: {len(state['sources'])}
 - **Clustering Approach**: {state['config'].cluster_approach.replace('_', ' ').title()}
 - **Search Strategy**: Enhanced query with domain-specific terms
+- **AI Model Used**: {model_name}
 
 ## Sources"""
     
@@ -528,17 +669,46 @@ def report_node(state: RState) -> RState:
     return state
 
 def critic_node(state: RState) -> RState:
-    """Enhanced critique with domain-specific quality criteria"""
+    """Enhanced critique with domain-specific quality criteria and threshold"""
     if state.get("error"):
         state["critique"] = "NEEDS_MORE - Error in data collection"
         return state
     
     prompt_manager = PromptTemplateManager()
+    model_name = state.get("model_name", "llama3")
+    api_key = state.get("api_key", None)  # Get API key from state
+    
     critique_prompt = prompt_manager.generate_critique_prompt(
         state["report_md"], state["domain"]
     )
     
-    critique = llm(critique_prompt)
+    critique = llm(critique_prompt, model_name, api_key)  # Pass api_key
+    
+    quality_threshold = state.get("quality_threshold", 0.3)
+    
+    num_sources = len(state.get("sources", []))
+    num_clusters = len(state.get("clusters", {}))
+    report_length = len(state.get("report_md", "").split())
+    
+    source_score = min(1.0, num_sources / 8.0)
+    cluster_score = min(1.0, num_clusters / 3.0)
+    length_score = min(1.0, report_length / 500.0)
+    
+    overall_quality = (source_score + cluster_score + length_score) / 3.0
+    
+    critique += f"\n\nQuality Metrics:"
+    critique += f"\n- Sources: {num_sources}/8 ({source_score:.2f})"
+    critique += f"\n- Clusters: {num_clusters}/3 ({cluster_score:.2f})"
+    critique += f"\n- Report Length: {report_length} words ({length_score:.2f})"
+    critique += f"\n- Overall Score: {overall_quality:.2f}"
+    critique += f"\n- Threshold: {quality_threshold}"
+    critique += f"\n- Model Used: {model_name}"
+    
+    if overall_quality < quality_threshold:
+        critique = f"NEEDS_MORE - Quality score {overall_quality:.2f} below threshold {quality_threshold}\n\n" + critique
+    elif "NEEDS_MORE" not in critique.upper():
+        critique = f"OK - Quality score {overall_quality:.2f} meets threshold\n\n" + critique
+    
     state["critique"] = critique
     return state
 

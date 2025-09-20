@@ -1,4 +1,4 @@
-# run_streamlit_app.py
+# app.py
 # Simple launcher for the Streamlit Research Assistant
 
 import subprocess
@@ -16,7 +16,6 @@ def check_dependencies():
         'ddgs',
         'trafilatura',
         'sentence_transformers',
-        'scikit-learn',
         'langgraph'
     ]
     
@@ -38,24 +37,32 @@ def check_dependencies():
     return True
 
 def check_ollama():
-    """Check if Ollama is running"""
+    """Check if Ollama is running and has models available"""
     try:
         import ollama
-        # Try to list models
+        
+        # List models
         models = ollama.list()
-        if not models.get('models'):
-            print("No Ollama models found!")
-            print("Download a model first: ollama pull llama3")
+        print('models', models)
+        
+        if not models or not models.get("models"):
+            print("✅ Ollama is running, but no models found.")
+            print("👉 Download a model first, e.g.: `ollama pull llama3`")
             return False
-        
-        print("Ollama is running with models:")
-        for model in models['models']:
-            print(f"   - {model['name']}")
+
+        print("✅ Ollama is running with models:")
+        for model in models["models"]:
+            print(f"   - {model['model']}")
         return True
-        
+
+    except ImportError:
+        print("❌ Ollama Python package not installed!")
+        print("👉 Install it with: `pip install ollama`")
+        return False
     except Exception as e:
-        print("Ollama connection failed!")
-        print("Start Ollama first: ollama serve")
+        print("❌ Ollama connection failed!")
+        print("👉 Make sure Ollama is installed and running: `ollama serve`")
+        print(f"Error details: {e}")
         return False
 
 def main():
@@ -77,6 +84,7 @@ def main():
     # Get the directory containing this script
     script_dir = Path(__file__).parent
     streamlit_app = script_dir / "research-assistant.py"
+    print(f"Using script: {streamlit_app}")
     
     if not streamlit_app.exists():
         print(f"Cannot find research-assistant.py in {script_dir}")
